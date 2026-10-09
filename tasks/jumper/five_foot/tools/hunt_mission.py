@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
+from tasks.jumper.common.constants import HOME
 from tasks.jumper.five_foot.claw import (
     ARM_JOINTS,
     FINGER_JOINT,
@@ -22,28 +23,35 @@ from tasks.jumper.five_foot.claw import (
 )
 from tasks.jumper.five_foot.mdp.gripper import squeeze_limited
 from tasks.jumper.five_foot.mdp.pose_command import PITCH
-from tasks.jumper.five_foot.tools.grasp_objects import FOLLOWED
+from tasks.jumper.five_foot.objects import BIN_INNER_HALF
+from tasks.jumper.five_foot.tools.grasp_objects import FOLLOWED, NOT_FOLLOWED
 from tasks.jumper.five_foot.tools.hunt_motion import (
     LOOK_RANGE,
     SPOT_RANGE,
+    SKIRT_BAND,
     WALL_BODY,
     WALL_CLAW,
     WALL_FREE,
     Cmd,
     _base,
     _body_bearing,
+    _choose_side,
     _into,
     _off_wall,
     _root,
+    _skirt,
     _steer,
+    _turn_off_wall,
     _wall_gap,
     _wrap,
-    body_error,
     camera_look,
+    in_corner,
     in_tray,
     in_view,
+    looks_at_wall,
     over_tray,
 )
+from tasks.jumper.five_foot.tools.hunt_scene import CAN_WALL_H
 
 #: ``deploy/lib.rs`` ``PRESETS``, degrees, thumb up / thumb down / thumb-web up.
 PRESET_DEG = {
@@ -67,6 +75,20 @@ LIFT_SIGN = -1.0
 #: ``Claw.seat`` would put it. The anvil itself is one jaw, and closing on a
 #: bug parked under the anvil misses.
 SEAT_TOL = 0.012
+#: A creep that has stopped getting closer, and whose best gap is already
+#: inside this, closes. 14 mm is a 15 mm bug in the mouth; waiting for 12 mm
+#: burned the creep and started the approach over.
+STALL_GAP = 0.020
+#: Control steps, at 50 Hz, with no improvement before that close. About 0.4 s.
+STALL_STEPS = 20
+#: Right-front foot, tucked up. ``J2`` is the roll that plants that foot:
+#: the leg sticks out in -Y, and a more negative roll lifts the toe. ``J1``
+#: pitches it in so the raised claw is not left against the wall. Held only
+#: while a corner grasp is still short of the seat.
+RF_TUCK = {
+    "RF_J1_joint": HOME["RF_J1_joint"] + 0.6,
+    "RF_J2_joint": HOME["RF_J2_joint"] - 0.9,
+}
 
 #: Setpoint step toward the arm goal, per control step. ``deploy/lib.rs``
 #: ``ARM_INTERP``.
@@ -78,6 +100,13 @@ LIN_LIM = 0.5
 ANG_LIM = 2.0
 
 SEARCH_VX = 0.18
+#: How close a remembered bug has to be before a search that still cannot
+#: see it gives up on that spot.
+RECALL_REACH = 0.25
+#: Extra shoulder travel, past the carry lift, once the bug is at the can.
+#: The carry lift leaves the mouth about level with the rim, and the jaws
+#: meet the wood instead of clearing it.
+DROP_RAISE = 0.45
 #: Nose down, in radians. Positive pitch is nose down, and 15 degrees is the
 #: edge of the band the policy tracks while it is walking. The onboard camera
 #: looks forward, so a level search walks over a bug on the floor.
@@ -302,16 +331,30 @@ class Hunt:
     age: int = 0
     search_s: float = 0.0
     delivered: set[str] = field(default_factory=set)
+    #: Bug name to the last xy the camera saw, for a bug he is not already chasing.
+    noted: dict[str, np.ndarray] = field(default_factory=dict)
+    #: +1 or -1, which way he is walking along the current wall. Kept until
+    #: he is clear, so the skirt does not reverse him back into the face.
+    wall_side: float | None = None
     hold_yaw: float = 0.0
     seat_xy: np.ndarray = field(default_factory=lambda: np.zeros(2))
     lift_sign: float = LIFT_SIGN
     verify_z: tuple[float, float] | None = None
     creep_best: float = 1.0
+    creep_still: int = 0
     creep_err: np.ndarray = field(default_factory=lambda: np.zeros(2))
+    #: Empty lifts on the bug in hand. One returns to creep. Two stows.
+    empty_lifts: int = 0
+    #: The right-front claw is held up. The gait action owns that leg, so
+    #: ``tuck_off_claw`` rewrites its slice before the step.
+    tuck_rf: bool = False
     nudge: int = 0
     rake: int = 0
     settle: int = 0
     carry_z: float = 0.0
+    #: Shoulder raise past the carry, ramped once the bug is at the rim.
+    #: A step straight to ``DROP_RAISE`` flicks the bug out of the jaws.
+    raise_extra: float = 0.0
     preset: np.ndarray = field(default_factory=lambda: GRASP_POSE.copy())
 
     def go(self, state: str) -> None:
@@ -406,6 +449,8 @@ def _face_or_chase(hunt: Hunt, name: str, point: np.ndarray, bearing: float) -> 
     hunt.bug = name
     hunt.seen = point.copy()
     hunt.looked = False
+    hunt.noted.pop(name, None)
+    hunt.empty_lifts = 0
     hunt.go("approach")
     return None
 
@@ -429,6 +474,86 @@ def _sight(env, hunt: Hunt, robot, model) -> tuple[Cmd, float] | None:
     return (STOP if faced is None else faced), 0.0
 
 
+def _note_others(env, hunt: Hunt, model) -> None:
+    """Store any bug the camera can see that is not the one already in hand.
+
+    The chase does not switch. After the current bug is delivered, search
+    walks back to the stored spot.
+    """
+    robot = env.scene["robot"]
+    origin, look, half = camera_look(robot, model)
+    # During a search the closest bug in frame is the one he will chase.
+    # Remember the others, not that one.
+    busy = hunt.bug if hunt.bug is not None else _spot(env, hunt, model)
+    for name in hunt.bugs:
+        if name == busy or _in_can(env, hunt, name):
+            hunt.noted.pop(name, None)
+            continue
+        point = _root(env.scene[name])
+        if not in_view(origin, look, half, point):
+            continue
+        if name not in hunt.noted:
+            print(f"[hunt] remembered {name} at ({point[0]:+.2f}, {point[1]:+.2f})")
+        hunt.noted[name] = point[:2].copy()
+
+
+def _nearest_note(env, hunt: Hunt, robot) -> str | None:
+    pos, _, _ = _base(robot)
+    best, best_d = None, math.inf
+    for name in list(hunt.noted):
+        if _in_can(env, hunt, name):
+            hunt.noted.pop(name, None)
+            continue
+        xy = hunt.noted[name]
+        dist = float(np.hypot(xy[0] - pos[0], xy[1] - pos[1]))
+        if dist < best_d:
+            best, best_d = name, dist
+    return best
+
+
+def _recall(hunt: Hunt, robot, name: str) -> tuple[Cmd, float] | None:
+    """Walk face-front to a spot remembered during another grab.
+
+    ``None`` means he reached it and the camera still does not have the bug,
+    so the note is dropped and the search carries on.
+    """
+    xy = hunt.noted[name]
+    pos, yaw, _ = _base(robot)
+    dist = float(np.hypot(xy[0] - pos[0], xy[1] - pos[1]))
+    if dist < RECALL_REACH:
+        print(f"[hunt] {name} was not at the remembered spot")
+        hunt.noted.pop(name, None)
+        return None
+    face = math.atan2(xy[1] - pos[1], xy[0] - pos[0])
+    turn = _wrap(face - yaw)
+    if abs(turn) > 0.40:
+        return (0.0, 0.0, float(np.clip(1.2 * turn, -1.0, 1.0))), LOOK_DOWN
+    return (0.16, 0.0, float(np.clip(turn, -0.5, 0.5))), LOOK_DOWN
+
+
+def _search_move(hunt: Hunt, xy: np.ndarray, yaw: float, inward: np.ndarray, gap: float) -> Cmd:
+    """Spiral in the open, and bend along the wall as it gets close.
+
+    The side along the wall is chosen once and kept, so leaving one wall
+    does not turn him straight back into it.
+    """
+    radius = 0.35 + 0.04 * hunt.search_s
+    spiral_wz = SEARCH_VX / radius
+    if gap >= SKIRT_BAND:
+        hunt.wall_side = None
+        return (SEARCH_VX, 0.0, spiral_wz)
+    hunt.wall_side = _choose_side(yaw, inward, hunt.wall_side, xy)
+    skirt = _skirt(yaw, inward, hunt.wall_side)
+    if gap < WALL_BODY:
+        return skirt
+    blend = (SKIRT_BAND - gap) / (SKIRT_BAND - WALL_BODY)
+    return (
+        (1.0 - blend) * SEARCH_VX + blend * skirt[0],
+        0.0,
+        (1.0 - blend) * spiral_wz + blend * skirt[2],
+    )
+
+
 def _search(env, hunt: Hunt, arm: Arm, model) -> tuple[Cmd, float]:
     del arm
     if len(hunt.delivered) == len(hunt.bugs):
@@ -445,9 +570,21 @@ def _search(env, hunt: Hunt, arm: Arm, model) -> tuple[Cmd, float]:
         return STOP, 0.0
     if hinted is None:
         hunt.looked = False
+    noted = _nearest_note(env, hunt, robot)
+    if noted is not None:
+        recalled = _recall(hunt, robot, noted)
+        if recalled is not None:
+            return recalled
+    pos, yaw, _ = _base(robot)
+    gap, inward = _wall_gap(pos[:2])
+    origin, look, _half = camera_look(robot, model)
+    if looks_at_wall(origin, look):
+        # The camera is on the wall and no bug is in view. Turn along the
+        # wall until the floor is in frame again.
+        hunt.wall_side = _choose_side(yaw, inward, hunt.wall_side, pos[:2])
+        return _turn_off_wall(yaw, inward, hunt.wall_side), LOOK_DOWN
     hunt.search_s += float(env.step_dt)
-    radius = 0.35 + 0.04 * hunt.search_s
-    return (SEARCH_VX, 0.0, SEARCH_VX / radius), LOOK_DOWN
+    return _search_move(hunt, pos[:2], yaw, inward, gap), LOOK_DOWN
 
 
 def _scan(env, hunt: Hunt, arm: Arm, model) -> tuple[Cmd, float]:
@@ -514,16 +651,26 @@ def _approach(env, hunt: Hunt, arm: Arm, model) -> tuple[Cmd, float]:
     if not in_view(origin, look, half, point):
         _lose(hunt, robot, bearing)
         cmd = STOP
-    elif abs(bearing) > 0.35:
+    elif abs(bearing) > 0.28:
+        # The face, not the claw. The seat sits off the centre line, and
+        # aiming it yaws the body until the jaw leads and knocks the bug away.
         cmd = _turn_to(bearing)
     else:
         pitch = LOOK_DOWN
         hunt.seen = point.copy()
-        vel, arrived = body_error(robot, point[:2], hunt.seat_xy)
-        vx, vy, wz = vel
-        # Forward only while it is in view. A negative command is the
-        # trunk following a bug it has already walked past.
-        cmd = _off_wall(robot, (max(0.0, vx), vy, wz), WALL_BODY)
+        # The claw stays stowed for the walk. It comes down in extend, once
+        # he has stopped. Lowering it on the way in stalls the gait: the
+        # policy was trained with the claw carried, and an arm in motion
+        # is not a walk it tracks.
+        reach = max(float(hunt.seat_xy[0]), 0.18)
+        if _dist > reach + 0.05:
+            cmd = _off_wall(robot, (
+                0.28, 0.0, float(np.clip(bearing, -0.35, 0.35)),
+            ), WALL_BODY)
+        elif abs(bearing) > 0.25:
+            cmd = _turn_to(bearing)
+        else:
+            arrived = True
     if arrived:
         _, hunt.hold_yaw, _ = _base(robot)
         hunt.go("extend")
@@ -576,16 +723,31 @@ def _drag_off_wall(hunt: Hunt, arm: Arm, bearing: float) -> Cmd:
     return (-0.16, 0.0, float(np.clip(bearing, -0.4, 0.4)))
 
 
-def _step_to_seat(robot, flat: np.ndarray, gap: float, yaw_err: float, reach: float,
+def _seat_axes(flat: np.ndarray, wall_gap: float) -> tuple[float, float]:
+    """Forward and sideways together, each a full step if that axis is off.
+
+    Sharing one 0.18 across both axes left each one too small to start the
+    gait, which is why the mouth stopped beside the bug. An axis already
+    inside the seat tolerance contributes nothing. Backing up is open floor
+    only: against the wall it follows the bug into the face.
+    """
+    vx = 0.0
+    if float(flat[0]) > SEAT_TOL:
+        vx = 0.18
+    elif float(flat[0]) < -SEAT_TOL and wall_gap >= 0.20:
+        vx = -0.16
+    vy = 0.0
+    if abs(float(flat[1])) > SEAT_TOL:
+        vy = 0.18 if float(flat[1]) > 0.0 else -0.18
+    return vx, vy
+
+
+def _step_to_seat(robot, flat: np.ndarray, wall_gap: float, yaw_err: float, reach: float,
                   yaw_clip: float) -> Cmd:
     """One gait step toward the seat. Slower than this never starts the gait."""
-    direction = flat / max(gap, 1.0e-6)
+    vx, vy = _seat_axes(flat, wall_gap)
     wz = 0.0 if abs(yaw_err) < 0.15 else float(np.clip(yaw_err, -yaw_clip, yaw_clip))
-    return _off_wall(robot, (
-        float(np.clip(max(0.0, direction[0]) * 0.18, 0.0, 0.25)),
-        float(np.clip(direction[1] * 0.18, -0.20, 0.20)),
-        wz,
-    ), max(0.10, reach - 0.02))
+    return _off_wall(robot, (vx, vy, wz), max(0.10, reach - 0.02))
 
 
 def _creep_closed(env, hunt: Hunt, arm: Arm, robot, bug: np.ndarray) -> Cmd:
@@ -596,17 +758,35 @@ def _creep_closed(env, hunt: Hunt, arm: Arm, robot, bug: np.ndarray) -> Cmd:
     gap = float(np.hypot(flat[0], flat[1]))
     if hunt.age == 1:
         hunt.creep_best = gap
-    if gap <= hunt.creep_best:
+        hunt.creep_err = flat.copy()
+        hunt.creep_still = 0
+    if gap < hunt.creep_best - 0.001:
         hunt.creep_best = gap
         hunt.creep_err = flat.copy()
+        hunt.creep_still = 0
+    else:
+        hunt.creep_still += 1
     wall_gap, _inward = _wall_gap(bug[:2])
+    corner = in_corner(bug[:2])
+    # The other front claw meets the wall in a corner. Hold it up until the
+    # mouth is on the bug. One wall is still a drag: the jaw cannot pass it.
+    if corner and gap >= SEAT_TOL:
+        if not hunt.tuck_rf:
+            print(f"[hunt] tucking the off claw, {hunt.bug} is in a corner")
+        hunt.tuck_rf = True
+    else:
+        hunt.tuck_rf = False
     reach = float(np.hypot(hunt.seat_xy[0], hunt.seat_xy[1]))
     _dist, bearing = _body_bearing(robot, bug)
-    if wall_gap < WALL_FREE and gap < 0.05:
+    stalled = hunt.creep_best < STALL_GAP and hunt.creep_still >= STALL_STEPS
+    if wall_gap < WALL_FREE and not corner and gap < 0.05:
         return _drag_off_wall(hunt, arm, bearing)
-    if wall_gap >= WALL_FREE and (gap < SEAT_TOL or (hunt.rake > 0 and gap < 0.05)):
+    if (corner or wall_gap >= WALL_FREE) and (
+        gap < SEAT_TOL or stalled or (hunt.rake > 0 and gap < 0.05)
+    ):
         # After a drag, close while the bug is still in the mouth. Walking
-        # forward again would put it back on the wall.
+        # forward again would put it back on the wall. A stall inside 20 mm
+        # is the same close: the mouth has stopped on the bug.
         hunt.go("close")
         return STOP
     if hunt.age > CREEP_LIMIT:
@@ -618,17 +798,16 @@ def _creep_closed(env, hunt: Hunt, arm: Arm, robot, bug: np.ndarray) -> Cmd:
         hunt.go("stow")
         return STOP
     yaw_err = _wrap(bearing) if wall_gap < 0.20 else _wrap(hunt.hold_yaw - yaw)
-    if gap < 0.08:
-        # A steady walk steps past, and a pulse shorter than a step only
-        # leans. One step is about 0.4 s at the speed the gait actually
-        # uses, then a pause so it can settle on the bug. Forward only:
-        # backing up is how a bug on the wall was followed into the face.
+    if gap < 0.04:
+        # Both axes, but in pulses. A steady walk this close steps past the
+        # bug. One step is about 0.4 s, then a short pause to settle.
         hunt.nudge += 1
-        if hunt.nudge % 60 < 20:
-            return _step_to_seat(robot, flat, gap, yaw_err, reach, 0.5)
-        return STOP
+        if hunt.nudge % 30 >= 20:
+            return STOP
+        vx, vy = _seat_axes(flat, wall_gap)
+        return _off_wall(robot, (vx, vy, 0.0), max(0.10, reach - 0.02))
     hunt.nudge = 0
-    return _step_to_seat(robot, flat, gap, yaw_err, reach, 0.6)
+    return _step_to_seat(robot, flat, wall_gap, yaw_err, reach, 0.6)
 
 
 def _creep(env, hunt: Hunt, arm: Arm, model) -> tuple[Cmd, float]:
@@ -663,33 +842,93 @@ def _verify(env, hunt: Hunt, arm: Arm, model) -> tuple[Cmd, float]:
     frac = min(1.0, hunt.age / 25.0)
     arm.goal[1] = hunt.preset[1] + frac * hunt.lift_sign * LIFT_RAD
     arm.finger = GRIPPER_CLOSED
+    bug_z = float(_root(env.scene[hunt.bug])[2])
+    anvil_z = float(env.claw.mouth()[0, 2])
+    z0, a0 = hunt.verify_z
+    rise_a = anvil_z - a0
+    rise_b = bug_z - z0
+    # Once the anvil is clearly up, a bug that has not come with it is not
+    # in the jaws. Finish the raise and it gets flicked out of a second try.
+    held = rise_a > 0.005 and rise_b >= FOLLOWED * rise_a
+    # A bug that has not moved while the anvil has is not in the jaws.
+    # Cut the raise there. One that is merely slow still gets the full check.
+    if hunt.age >= 15 and rise_a > 0.008 and rise_b < NOT_FOLLOWED * rise_a:
+        return _empty_lift(hunt, arm, rise_b, rise_a)
     if hunt.age >= VERIFY_STEPS:
-        bug_z = float(_root(env.scene[hunt.bug])[2])
-        anvil_z = float(env.claw.mouth()[0, 2])
-        z0, a0 = hunt.verify_z
-        rise_a = anvil_z - a0
-        rise_b = bug_z - z0
-        ok = rise_a > 0.005 and rise_b >= FOLLOWED * rise_a
-        print(f"[hunt] verify {hunt.bug}: bug {rise_b * 1000:.1f} mm, "
-              f"anvil {rise_a * 1000:.1f} mm, "
-              f"{'carried' if ok else 'left behind'}")
-        if ok:
+        if held:
+            print(f"[hunt] verify {hunt.bug}: bug {rise_b * 1000:.1f} mm, "
+                  f"anvil {rise_a * 1000:.1f} mm, carried")
+            hunt.empty_lifts = 0
             hunt.go("carry")
         else:
-            hunt.bug = None
-            arm.finger = GRIPPER_OPEN
-            hunt.go("stow")
+            return _empty_lift(hunt, arm, rise_b, rise_a)
     return STOP, 0.0
+
+
+def _empty_lift(hunt: Hunt, arm: Arm, rise_b: float, rise_a: float) -> tuple[Cmd, float]:
+    """The anvil rose and the bug did not. Open, and try the seat once more."""
+    hunt.empty_lifts += 1
+    arm.goal = hunt.preset.copy()
+    arm.finger = GRIPPER_OPEN
+    print(f"[hunt] verify {hunt.bug}: bug {rise_b * 1000:.1f} mm, "
+          f"anvil {rise_a * 1000:.1f} mm, left behind")
+    if hunt.empty_lifts >= 2:
+        hunt.bug = None
+        hunt.go("stow")
+    else:
+        hunt.go("creep")
+    return STOP, 0.0
+
+
+def tuck_off_claw(env, action, hunt: Hunt):
+    """Replace the right-front hip and knee in ``action`` with the tuck.
+
+    Those joints are in the gait action, so a target written before
+    ``step`` is overwritten. The other joints stay the policy's. No tuck
+    leaves ``action`` untouched.
+    """
+    if not hunt.tuck_rf:
+        return action
+    term = env.action_manager.get_term("joint_pos")
+    names = list(term.target_names)
+    scale = term.scale
+    offset = term.offset
+    out = action.clone()
+    flat = out.reshape(-1)
+    for joint, target in RF_TUCK.items():
+        idx = names.index(joint)
+        sc = scale if not torch.is_tensor(scale) else scale.reshape(-1)[idx]
+        off = offset if not torch.is_tensor(offset) else offset.reshape(-1)[idx]
+        flat[idx] = (float(target) - float(off)) / float(sc)
+    return out
+
+
+def _hold_bug(arm: Arm, hunt: Hunt, extra: float) -> None:
+    """Grasp pose, lifted, finger shut. ``extra`` is the raise over the carry."""
+    arm.goal = hunt.preset.copy()
+    arm.goal[1] = hunt.preset[1] + hunt.lift_sign * (LIFT_RAD + extra)
+    arm.finger = GRIPPER_CLOSED
 
 
 def _carry(env, hunt: Hunt, arm: Arm, model) -> tuple[Cmd, float]:
     del model
     robot = env.scene["robot"]
-    arm.goal = hunt.preset.copy()
-    arm.goal[1] = hunt.preset[1] + hunt.lift_sign * LIFT_RAD
-    arm.finger = GRIPPER_CLOSED
     bug = _root(env.scene[hunt.bug])
     tray = _root(env.scene["tray"])
+    # Raise before the jaws meet the rim. The carry height is about the
+    # rim, so walking the last stretch at that height puts the claw on
+    # the wood and the bug never gets over it.
+    bug_r = float(np.hypot(bug[0] - tray[0], bug[1] - tray[1]))
+    # The raise starts at the rim, not a body-length out. Lifting early
+    # is what shook the bug loose and opened the claw short of the can.
+    at_can = over_tray(bug, tray) or bug_r < BIN_INNER_HALF + 0.08
+    if hunt.age == 1:
+        hunt.raise_extra = 0.0
+    if at_can:
+        hunt.raise_extra = min(DROP_RAISE, hunt.raise_extra + 0.015)
+    else:
+        hunt.raise_extra = max(0.0, hunt.raise_extra - 0.03)
+    _hold_bug(arm, hunt, hunt.raise_extra)
     mouth_z = float(env.claw.mouth()[0, 2])
     if hunt.age == 1:
         # Height above the anvil, not the floor. The gait crouches as it
@@ -700,13 +939,22 @@ def _carry(env, hunt: Hunt, arm: Arm, model) -> tuple[Cmd, float]:
     # is in front, is still short of it, and the gait shakes the bug loose.
     # Face the can and walk forward, so the bug arrives first. If it has
     # already fallen, stop: steering at a bug on the floor walks the body
-    # straight through the can.
-    slipped = hunt.age > 1 and float(bug[2]) - mouth_z < hunt.carry_z - 0.025
+    # straight through the can. The mouth has to be at its pose first: while
+    # the raise is still moving, the bug lags the anvil and looks dropped.
+    slipped = (
+        hunt.age > 1
+        and arm.at_goal(0.20)
+        and float(bug[2]) - mouth_z < hunt.carry_z - 0.025
+    )
     if slipped:
         print(f"[hunt] {hunt.bug} slipped on the way to the tray")
         hunt.bug = None
         arm.finger = GRIPPER_OPEN
         hunt.go("stow")
+        return STOP, 0.0
+    # Stand and lift once the bug is at the can. Walking on while the jaws
+    # are still at the rim is what puts the claw into the wall.
+    if at_can and mouth_z < CAN_WALL_H + 0.02:
         return STOP, 0.0
     if over_tray(bug, tray):
         hunt.settle += 1
@@ -736,8 +984,7 @@ def _carry(env, hunt: Hunt, arm: Arm, model) -> tuple[Cmd, float]:
 
 def _drop(env, hunt: Hunt, arm: Arm, model) -> tuple[Cmd, float]:
     del model
-    arm.goal = hunt.preset.copy()
-    arm.goal[1] = hunt.preset[1] + hunt.lift_sign * LIFT_RAD
+    _hold_bug(arm, hunt, DROP_RAISE)
     arm.finger = GRIPPER_OPEN
     bug = _root(env.scene[hunt.bug])
     tray = _root(env.scene["tray"])
@@ -815,15 +1062,22 @@ def tick(env, hunt: Hunt, arm: Arm, model) -> tuple[Cmd, float]:
         cmd, pitch = STOP, 0.0
     else:
         cmd, pitch = STATES[hunt.state](env, hunt, arm, model)
+    if hunt.state != "creep":
+        hunt.tuck_rf = False
     if hunt.state == "done" and hunt.age == 1:
         print("[hunt] every bug is in the tray")
     # Search, approach and the carry all aim through the can. One steer at
     # the end is what keeps the trunk off it, whichever state asked to walk.
     margin = WALL_CLAW if hunt.state == "creep" else WALL_BODY
-    cmd = _steer(
+    cmd, side = _steer(
         robot, cmd, _root(env.scene["tray"])[:2], margin,
         deliver=hunt.state in ("carry", "drop"),
+        wall_side=hunt.wall_side,
     )
+    if side is not None:
+        hunt.wall_side = side
+    # Other bugs in frame are stored, not chased. The one in hand stays the target.
+    _note_others(env, hunt, model)
     # The gripper event runs during the step and, once a key has been touched,
     # writes the trigger. A trigger at rest is open, which is a drop wherever
     # the robot happens to be. Pin the finger to what this step asked for.
